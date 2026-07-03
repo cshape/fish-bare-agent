@@ -1,0 +1,13 @@
+{
+  "name": "fish-bare-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "smoke": "node --env-file=.env scripts/smoke.js"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "ws": "^8.18.0"
+  }
+}
