@@ -54,6 +54,12 @@ const FISH_LATENCY_MODE = process.env.FISH_LATENCY_MODE || "balanced"; // normal
 const MIC_SAMPLE_RATE = 16000; // browser -> Deepgram
 const TTS_SAMPLE_RATE = 24000; // Fish -> browser
 
+// Energy gate for latency measurement (NOT for turn-taking — that's Flux's
+// job). A mic chunk whose RMS clears this is treated as "the user is audibly
+// speaking"; turn-detect latency is measured from the last such chunk.
+const VAD_THRESHOLD_DB = Number(process.env.VAD_THRESHOLD_DB || -40); // dBFS
+const VAD_RMS = 32768 * 10 ** (VAD_THRESHOLD_DB / 20);
+
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   "You are a friendly voice assistant. Your replies are spoken aloud by a " +
@@ -266,14 +272,11 @@ class Session {
     this.history = [];
     this.turn = null;
     this.turnCounter = 0;
-    // Audio clock: how many seconds of mic audio we have forwarded to
-    // Deepgram, and the wall time of the last forwarded chunk. Because the
-    // mic streams in real time, stream position p maps to wall time
-    //   wallAtLastSend - (streamSeconds - p) * 1000
-    // which lets us measure turn-detection latency against when the user
-    // actually stopped speaking (audio_window_end), not when we noticed.
-    this.streamSeconds = 0;
-    this.wallAtLastSend = 0;
+    // Wall time of the last mic chunk with speech-level energy. Flux's
+    // TurnInfo events have no word timings (audio_window_end just tracks how
+    // much audio it has processed, silence included), so this energy gate is
+    // what "the user stopped speaking" is measured against.
+    this.lastSpeechWall = 0;
     this.dg = this.#connectDeepgram();
   }
 
@@ -290,13 +293,16 @@ class Session {
   }
 
   onMicAudio(buf) {
-    this.streamSeconds += buf.length / 2 / MIC_SAMPLE_RATE;
-    this.wallAtLastSend = Date.now();
+    let sum = 0;
+    const samples = buf.length >> 1;
+    for (let i = 0; i < buf.length - 1; i += 2) {
+      const s = buf.readInt16LE(i);
+      sum += s * s;
+    }
+    if (samples && Math.sqrt(sum / samples) > VAD_RMS) {
+      this.lastSpeechWall = Date.now();
+    }
     if (this.dg.readyState === WebSocket.OPEN) this.dg.send(buf);
-  }
-
-  #wallAtStreamPos(seconds) {
-    return this.wallAtLastSend - (this.streamSeconds - seconds) * 1000;
   }
 
   #connectDeepgram() {
@@ -374,9 +380,10 @@ class Session {
           if (this.turn && !this.turn.committed) this.#cancelTurn();
           break;
         }
-        // How long Deepgram took to call the turn, measured from when the
-        // user actually stopped speaking (audio clock), not from now.
-        const speechEndWall = this.#wallAtStreamPos(msg.audio_window_end ?? this.streamSeconds);
+        // How long Deepgram took to call the turn, measured from the last
+        // mic chunk that had speech-level energy — i.e. the silence Flux
+        // waited out before deciding the user was done, plus transit.
+        const speechEndWall = this.lastSpeechWall || Date.now();
         const sttMs = Math.max(0, Date.now() - speechEndWall);
         this.sendJson({ type: "user_final", text: transcript });
         if (this.turn && !this.turn.committed && this.turn.userText === transcript) {

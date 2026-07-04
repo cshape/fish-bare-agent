@@ -50,9 +50,10 @@ npm run smoke
 - **Sentence chunking**: LLM tokens buffer until a punctuation boundary, so
   Fish synthesizes whole clauses (one Fish websocket per turn, one flush at
   end of input).
-- **Latency chips** in the header, measured per turn: turn detect (from when
-  speech actually stopped, via Flux's `audio_window_end` audio clock), LLM
-  first token, TTS first audio, and voice→voice.
+- **Latency chips** in the header, measured per turn: turn detect (how long
+  after you audibly stopped speaking Flux called the turn — measured by a
+  server-side energy gate on the mic, since Flux events carry no word
+  timings), LLM first token, TTS first audio, and voice→voice.
 
 Tuning (all in `.env`): `DEEPGRAM_EOT_THRESHOLD` (lower = snappier turns,
 more false cut-ins), `DEEPGRAM_EAGER_EOT_THRESHOLD` (lower = earlier
