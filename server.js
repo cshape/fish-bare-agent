@@ -126,6 +126,31 @@ class SentenceChunker {
 }
 
 // ---------------------------------------------------------------------------
+// Echo detection — is this "user" transcript actually the agent's own voice
+// leaking speaker -> mic? Compared against what the agent recently said.
+// ---------------------------------------------------------------------------
+
+function normalizeText(s) {
+  return s
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isEchoOf(transcript, agentText) {
+  const t = normalizeText(transcript);
+  const a = normalizeText(agentText);
+  if (!t || !a) return false;
+  if (a.includes(t)) return true;
+  // Fuzzy: STT mangles echo, so accept high word overlap too.
+  const words = t.split(" ");
+  const agentWords = new Set(a.split(" "));
+  const hits = words.filter((w) => agentWords.has(w)).length;
+  return words.length >= 2 && hits / words.length >= 0.8;
+}
+
+// ---------------------------------------------------------------------------
 // Gemma LLM — OpenAI-compatible streaming chat completion.
 // ---------------------------------------------------------------------------
 
@@ -287,7 +312,29 @@ class Session {
     // much audio it has processed, silence included), so this energy gate is
     // what "the user stopped speaking" is measured against.
     this.lastSpeechWall = 0;
+    // Self-interruption defenses, togglable live from the client ("config").
+    //   bargeMode  "instant": StartOfTurn cuts agent audio immediately.
+    //              "smart":   while the agent is audible, hold the cut until
+    //                         the transcript proves real speech (non-echo,
+    //                         >= minWords).
+    //   echoFilter drop user turns whose transcript matches what the agent
+    //              was just saying (speaker -> mic leakage).
+    this.cfg = { bargeMode: "instant", echoFilter: true, minWords: 2 };
+    // Playback horizon: wall time when the client's speaker goes quiet if we
+    // send nothing more. Audio is played in real time on both transports, so
+    // shipped-bytes fully determine it. This is how the engine knows the
+    // agent is audibly speaking without any client reporting.
+    this.playbackHorizon = 0;
+    this.userTurnAudible = false; // was the agent audible when this user turn began?
+    this.bargeHeld = false; // smart mode: cut deferred, awaiting proof
     this.dg = this.#connectDeepgram();
+  }
+
+  applyConfig(cfg) {
+    if (cfg.bargeMode === "instant" || cfg.bargeMode === "smart") this.cfg.bargeMode = cfg.bargeMode;
+    if (typeof cfg.echoFilter === "boolean") this.cfg.echoFilter = cfg.echoFilter;
+    if ([1, 2, 3].includes(cfg.minWords)) this.cfg.minWords = cfg.minWords;
+    console.log(`[session] ${this.sid} config:`, this.cfg);
   }
 
   sendJson(obj) {
@@ -300,12 +347,21 @@ class Session {
     const sink = this.gatewayWs ?? this.client;
     if (sink.readyState === WebSocket.OPEN) {
       sink.send(buf, { binary: true });
+      const ms = (buf.length / 2 / TTS_SAMPLE_RATE) * 1000;
+      this.playbackHorizon = Math.max(Date.now(), this.playbackHorizon) + ms;
     }
+  }
+
+  // Is agent audio (probably) still coming out of the client's speaker?
+  // 300 ms of grace covers transit, playout buffering, and echo tail.
+  agentAudible() {
+    return Date.now() < this.playbackHorizon + 300;
   }
 
   // Barge-in flush must reach both the UI (transcript state) and whichever
   // transport is pacing audio (the gateway keeps its own outbound queue).
   sendClear() {
+    this.playbackHorizon = 0;
     this.sendJson({ type: "clear" });
     if (this.gatewayWs?.readyState === WebSocket.OPEN) {
       this.gatewayWs.send(JSON.stringify({ type: "clear" }));
@@ -376,27 +432,66 @@ class Session {
     return dg;
   }
 
+  // What the agent has been saying lately — the echo filter's reference.
+  #recentAgentText() {
+    let last = "";
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].role === "assistant") {
+        last = this.history[i].content;
+        break;
+      }
+    }
+    return (last + " " + (this.turn?.spoken ?? "")).slice(-600);
+  }
+
+  // Echo filter verdict for a transcript belonging to the current user turn.
+  #isSuppressedEcho(transcript) {
+    return this.cfg.echoFilter && this.userTurnAudible && isEchoOf(transcript, this.#recentAgentText());
+  }
+
+  // Smart mode: a barge-in is held until the transcript proves real speech.
+  // `final` (EndOfTurn) waives the minWords requirement — Flux is sure.
+  #maybeConfirmBarge(transcript, final = false) {
+    if (!this.bargeHeld) return;
+    const words = transcript.split(/\s+/).filter(Boolean).length;
+    const echo = this.cfg.echoFilter && isEchoOf(transcript, this.#recentAgentText());
+    if (!echo && (final || words >= this.cfg.minWords)) {
+      this.bargeHeld = false;
+      if (this.turn) this.#cancelTurn();
+      this.sendClear();
+    }
+  }
+
   #onTurnInfo(msg) {
     const transcript = (msg.transcript || "").trim();
     switch (msg.event) {
       case "StartOfTurn":
-        // A new turn began: barge-in on whatever the agent was doing. Always
-        // clear browser playback, even with no turn in flight — Fish
-        // synthesizes faster than realtime, so the browser's audio queue can
-        // outlive the server-side turn by several seconds.
-        if (this.turn) this.#cancelTurn();
-        this.sendClear();
+        // A new user turn began. Remember whether the agent was audibly
+        // speaking — that's the echo-suspicion window for this whole turn.
+        this.userTurnAudible = this.agentAudible();
+        this.bargeHeld = this.userTurnAudible && this.cfg.bargeMode === "smart";
+        if (!this.bargeHeld) {
+          // Instant cut. Clear even with no turn in flight — the client-side
+          // playback queue can outlive the server-side turn.
+          if (this.turn) this.#cancelTurn();
+          this.sendClear();
+        }
         this.sendJson({ type: "user_start" });
         break;
 
       case "Update":
-        if (transcript) this.sendJson({ type: "user_partial", text: transcript });
+        if (!transcript) break;
+        this.#maybeConfirmBarge(transcript);
+        this.sendJson({ type: "user_partial", text: transcript });
         break;
 
       case "EagerEndOfTurn":
         // Flux thinks the user is probably done — start generating now,
         // buffered, while it waits for enough silence to be sure.
         if (!transcript) break;
+        this.#maybeConfirmBarge(transcript);
+        if (this.bargeHeld) break; // agent still talking; speech unproven
+        if (this.#isSuppressedEcho(transcript)) break; // don't speculate on echo
         if (this.turn && !this.turn.committed && this.turn.userText === transcript) break;
         if (this.turn) this.#cancelTurn();
         this.#startTurn(transcript, { speculative: true });
@@ -411,8 +506,18 @@ class Session {
       case "EndOfTurn": {
         if (!transcript) {
           if (this.turn && !this.turn.committed) this.#cancelTurn();
+          this.bargeHeld = false;
           break;
         }
+        if (this.#isSuppressedEcho(transcript)) {
+          // The "user" was the agent's own voice. Never answer it. In smart
+          // mode nothing was cut, so the agent talks straight through.
+          console.log(`[session] ${this.sid} echo suppressed: "${transcript}"`);
+          this.bargeHeld = false;
+          this.sendJson({ type: "echo_suppressed", text: transcript });
+          break;
+        }
+        this.#maybeConfirmBarge(transcript, true);
         // How long Deepgram took to call the turn, measured from the last
         // mic chunk that had speech-level energy — i.e. the silence Flux
         // waited out before deciding the user was done, plus transit.
@@ -679,7 +784,14 @@ server.on("upgrade", (req, socket, head) => {
       console.log(`[session] ${session.sid} connected`);
       session.sendJson({ type: "session", sid: session.sid });
       client.on("message", (data, isBinary) => {
-        if (isBinary) session.onMicAudio(data);
+        if (isBinary) {
+          session.onMicAudio(data);
+          return;
+        }
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "config") session.applyConfig(msg);
+        } catch {}
       });
       client.on("close", () => {
         console.log(`[session] ${session.sid} closed`);

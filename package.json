@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node --env-file=.env server.js",
     "smoke": "node --env-file=.env scripts/smoke.js",
+    "smoke:echo": "node --env-file=.env scripts/echo-smoke.js",
     "smoke:rtc": "scripts/rtc-smoke.sh"
   },
   "dependencies": {

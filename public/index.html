@@ -85,6 +85,40 @@
     }
     .chip .value .unit { font-size: 11px; font-weight: 500; color: var(--dim); }
     .chip.hero { background: var(--lavender); border-color: #d9d3e8; }
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      align-items: center;
+    }
+    .knob { display: flex; align-items: center; gap: 6px; }
+    .knob .klabel {
+      font-size: 10.5px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .seg {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      overflow: hidden;
+      background: var(--panel-2);
+    }
+    .seg button {
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border: none;
+      background: transparent;
+      color: var(--dim);
+      cursor: pointer;
+      border-radius: 0;
+    }
+    .seg button + button { border-left: 1px solid var(--border); }
+    .seg button.on { background: var(--coral-soft); color: var(--text); }
     #eager-badge {
       display: none;
       font-size: 10px;
@@ -133,6 +167,24 @@
       border: 1px solid #cfdfee;
     }
     .msg.interrupted { opacity: 0.6; }
+    .msg.echo {
+      opacity: 0.55;
+      background: var(--panel);
+      border: 1px dashed var(--border);
+    }
+    .msg.echo::after {
+      content: "echo suppressed";
+      display: block;
+      font-size: 10.5px;
+      color: var(--dim);
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    @media (max-width: 560px) {
+      #metrics { grid-template-columns: repeat(2, 1fr); }
+      #status { display: none; }
+    }
     footer {
       display: flex;
       align-items: center;
@@ -164,6 +216,32 @@
         <div id="orb"></div>
         <h1>fish bare agent</h1>
         <span class="sub">deepgram flux &rarr; gemma &rarr; fish tts</span>
+      </div>
+      <div id="controls">
+        <div class="knob">
+          <span class="klabel">transport</span>
+          <span class="seg" id="k-transport">
+            <button data-v="ws">ws</button><button data-v="webrtc">webrtc</button>
+          </span>
+        </div>
+        <div class="knob">
+          <span class="klabel">barge-in</span>
+          <span class="seg" id="k-barge">
+            <button data-v="instant">instant</button><button data-v="smart">smart</button>
+          </span>
+        </div>
+        <div class="knob">
+          <span class="klabel">echo filter</span>
+          <span class="seg" id="k-echo">
+            <button data-v="on">on</button><button data-v="off">off</button>
+          </span>
+        </div>
+        <div class="knob">
+          <span class="klabel">min words</span>
+          <span class="seg" id="k-words">
+            <button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button>
+          </span>
+        </div>
       </div>
       <div id="metrics">
         <div class="chip">

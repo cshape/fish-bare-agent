@@ -70,6 +70,19 @@ macOS UDP caveat; on Linux set `GATEWAY_PUBLIC_IP`).
   back silently. The model thinks while Deepgram waits out the silence.
 - **Barge-in**: `StartOfTurn` during a reply aborts the LLM fetch, closes the
   Fish socket, and tells the browser to drop its playback buffer.
+- **Self-interruption defenses** (header knobs, applied live per session; for
+  testing echo behavior on speakerphone devices):
+  - *barge-in* — `instant` cuts agent audio on `StartOfTurn`; `smart` holds
+    the cut while the agent is audible until the transcript proves real
+    speech (non-echo + `min words`). The engine knows the agent is audible
+    from a playback horizon: bytes shipped = seconds of speaker time, on
+    both transports.
+  - *echo filter* — drops "user" turns whose transcript matches what the
+    agent was just saying (speaker -> mic leakage). Suppressed turns show as
+    dashed "echo suppressed" bubbles and are never answered.
+  - *transport* — websocket vs webrtc, switchable between sessions.
+  - `npm run smoke:echo` regression-tests the filter by speaking the agent's
+    own reply back at it mid-stream.
 - **Sentence chunking**: LLM tokens buffer until a punctuation boundary, so
   Fish synthesizes whole clauses (one Fish websocket per turn, one flush at
   end of input).

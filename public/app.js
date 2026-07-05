@@ -4,10 +4,63 @@
 //                       gateway (Opus @ 48 kHz); the WS carries JSON only.
 // JSON events (transcripts, metrics, clear) arrive on the WS either way.
 
-const USE_RTC = new URLSearchParams(location.search).get("transport") === "webrtc";
-if (USE_RTC) document.querySelector(".sub").textContent += " · webrtc";
-
 const $ = (id) => document.getElementById(id);
+
+// --- knobs: transport + self-interruption defenses --------------------------
+// Persisted in localStorage; ?transport=webrtc overrides the saved transport.
+const settings = Object.assign(
+  { transport: "ws", bargeMode: "instant", echoFilter: true, minWords: 2 },
+  JSON.parse(localStorage.getItem("fish-bare-settings") || "{}"),
+);
+const urlTransport = new URLSearchParams(location.search).get("transport");
+if (urlTransport === "webrtc" || urlTransport === "ws") settings.transport = urlTransport;
+
+const useRtc = () => settings.transport === "webrtc";
+
+function saveSettings() {
+  localStorage.setItem("fish-bare-settings", JSON.stringify(settings));
+}
+
+function sendConfig() {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "config",
+      bargeMode: settings.bargeMode,
+      echoFilter: settings.echoFilter,
+      minWords: settings.minWords,
+    }));
+  }
+}
+
+function renderKnobs() {
+  const mark = (id, value) => {
+    for (const b of $(id).querySelectorAll("button")) {
+      b.classList.toggle("on", b.dataset.v === value);
+    }
+  };
+  mark("k-transport", settings.transport);
+  mark("k-barge", settings.bargeMode);
+  mark("k-echo", settings.echoFilter ? "on" : "off");
+  mark("k-words", String(settings.minWords));
+}
+
+function wireKnob(id, apply) {
+  $(id).addEventListener("click", (e) => {
+    const v = e.target.dataset?.v;
+    if (!v) return;
+    apply(v);
+    saveSettings();
+    renderKnobs();
+    sendConfig();
+  });
+}
+wireKnob("k-transport", (v) => {
+  if (v !== settings.transport && running) stop("transport changed — press start");
+  settings.transport = v;
+});
+wireKnob("k-barge", (v) => (settings.bargeMode = v));
+wireKnob("k-echo", (v) => (settings.echoFilter = v === "on"));
+wireKnob("k-words", (v) => (settings.minWords = Number(v)));
 const log = $("log");
 const orb = $("orb");
 const statusEl = $("status");
@@ -75,7 +128,7 @@ async function start() {
     return;
   }
 
-  if (!USE_RTC) {
+  if (!useRtc()) {
     // Capture context pinned to 16 kHz (the browser resamples the mic for us).
     inCtx = new AudioContext({ sampleRate: 16000 });
     await inCtx.audioWorklet.addModule("/mic-worklet.js");
@@ -154,7 +207,8 @@ async function setupRtc(sid) {
 function handleEvent(msg) {
   switch (msg.type) {
     case "session":
-      if (USE_RTC) setupRtc(msg.sid).catch(() => setStatus("webrtc setup failed"));
+      sendConfig();
+      if (useRtc()) setupRtc(msg.sid).catch(() => setStatus("webrtc setup failed"));
       break;
     case "ready":
       setStatus("listening — say something");
@@ -182,7 +236,7 @@ function handleEvent(msg) {
       log.scrollTop = log.scrollHeight;
       setStatus("speaking");
       // No player worklet on the webrtc path — approximate the orb from events.
-      if (USE_RTC) setOrb("speaking");
+      if (useRtc()) setOrb("speaking");
       break;
     case "clear": // barge-in: stop playback immediately
       // Only mark the reply interrupted if it was actually cut off — "clear"
@@ -192,12 +246,22 @@ function handleEvent(msg) {
       player?.port.postMessage({ cmd: "clear" });
       agentBubble = null;
       setStatus("listening");
-      if (USE_RTC) setOrb("listening");
+      if (useRtc()) setOrb("listening");
       break;
     case "agent_done":
       agentBubble = null;
       setStatus("listening");
-      if (USE_RTC) setOrb("listening");
+      if (useRtc()) setOrb("listening");
+      break;
+    case "echo_suppressed":
+      // The engine decided this "user turn" was the agent's own voice.
+      if (userBubble) {
+        userBubble.textContent = msg.text;
+        userBubble.classList.remove("partial");
+        userBubble.classList.add("echo");
+        userBubble = null;
+      }
+      setStatus("echo suppressed");
       break;
     case "metrics":
       showMetrics(msg);
@@ -239,3 +303,4 @@ function stop(reason) {
 }
 
 btn.onclick = () => (running ? stop() : start());
+renderKnobs();
