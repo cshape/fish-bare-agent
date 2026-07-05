@@ -60,6 +60,17 @@ npm run smoke:rtc
 `docker compose up --build` runs both services (see compose.yaml for the
 macOS UDP caveat; on Linux set `GATEWAY_PUBLIC_IP`).
 
+**Testing from a phone**: serve the page through an HTTPS tunnel (mic needs a
+secure origin), e.g. `ngrok http 8787`. On the same Wi-Fi, media flows
+directly to the laptop's LAN IP. Off-LAN (cellular), the gateway defaults to
+full ICE + STUN and hole-punches through home NAT — works on most home
+routers but not all (CGNAT); if ICE can't connect within 7s the client falls
+back to websocket audio automatically, and every ICE state transition is
+logged server-side (`rtc: checking/connected/failed`). Guaranteed off-LAN
+connectivity needs a public deployment or a TURN server. With `PUBLIC_IP`
+set (production), the gateway switches to ICE-Lite on one muxed UDP port
+(`ICE_MODE` / `STUN_URL` override).
+
 ## How it works
 
 - **Turn-taking** is Deepgram Flux's native `StartOfTurn` / `EndOfTurn` — no

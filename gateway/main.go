@@ -40,26 +40,46 @@ func main() {
 	udpPort := env("UDP_PORT", "7881")
 	engineURL := env("ENGINE_URL", "ws://127.0.0.1:8787")
 	publicIP := os.Getenv("PUBLIC_IP")
-
-	// One UDP socket for every call.
-	addr, err := net.ResolveUDPAddr("udp", ":"+udpPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	udpConn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		log.Fatal(err)
+	stunURL := env("STUN_URL", "stun:stun.l.google.com:19302")
+	// ICE mode:
+	//   "lite" — passive peer, single muxed UDP port, candidates = PUBLIC_IP
+	//            (or LAN/loopback). The production shape: needs a reachable
+	//            address. Default when PUBLIC_IP is set.
+	//   "full" — active connectivity checks + STUN server-reflexive
+	//            candidates, ephemeral ports. Hole-punches outward through
+	//            home NAT, so off-LAN devices (phones on cellular) can
+	//            connect to a gateway on a laptop. Default otherwise.
+	iceMode := env("ICE_MODE", "")
+	if iceMode == "" {
+		if publicIP != "" {
+			iceMode = "lite"
+		} else {
+			iceMode = "full"
+		}
 	}
 
 	se := webrtc.SettingEngine{}
-	se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpConn))
-	se.SetLite(true) // we have a reachable address; the browser does the ICE work
-	if publicIP != "" {
-		se.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	se.SetIncludeLoopbackCandidate(true) // keep plain localhost dev working
+	rtcConf := webrtc.Configuration{}
+
+	if iceMode == "lite" {
+		// One UDP socket for every call.
+		addr, err := net.ResolveUDPAddr("udp", ":"+udpPort)
+		if err != nil {
+			log.Fatal(err)
+		}
+		udpConn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpConn))
+		se.SetLite(true) // reachable address; the browser does the ICE work
+		if publicIP != "" {
+			se.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+		}
 	} else {
-		// Local dev: allow 127.0.0.1 candidates so localhost works offline.
-		se.SetIncludeLoopbackCandidate(true)
-		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+		rtcConf.ICEServers = []webrtc.ICEServer{{URLs: []string{stunURL}}}
 	}
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
@@ -77,7 +97,7 @@ func main() {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		answer, err := startCall(api, engineURL, req.SID, req.SDP)
+		answer, err := startCall(api, rtcConf, engineURL, req.SID, req.SDP)
 		if err != nil {
 			log.Printf("[%s] call setup failed: %v", req.SID, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -87,12 +107,16 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"sdp": answer})
 	})
 
-	log.Printf("gateway: signaling :%s, media :%s/udp, engine %s", port, udpPort, engineURL)
+	if iceMode == "lite" {
+		log.Printf("gateway: signaling :%s, media :%s/udp (ice-lite), engine %s", port, udpPort, engineURL)
+	} else {
+		log.Printf("gateway: signaling :%s, full ICE via %s (ephemeral udp), engine %s", port, stunURL, engineURL)
+	}
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func startCall(api *webrtc.API, engineURL, sid, offerSDP string) (string, error) {
-	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+func startCall(api *webrtc.API, conf webrtc.Configuration, engineURL, sid, offerSDP string) (string, error) {
+	pc, err := api.NewPeerConnection(conf)
 	if err != nil {
 		return "", err
 	}

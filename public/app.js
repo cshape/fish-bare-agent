@@ -191,7 +191,9 @@ async function initWsAudio() {
 // answers with host candidates (ICE-Lite).
 async function setupRtc(id) {
   rtcActive = true;
-  pc = new RTCPeerConnection();
+  // STUN lets an off-LAN phone (e.g. cellular) and the gateway hole-punch
+  // toward each other; on localhost/LAN it's just ignored.
+  pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
   for (const track of micStream.getAudioTracks()) pc.addTrack(track, micStream);
   pc.ontrack = (e) => {
     // Muted element keeps the remote stream flowing; audible playback goes
