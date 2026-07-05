@@ -72,7 +72,12 @@ let outCtx = null;
 let player = null;
 let micStream = null;
 let pc = null; // RTCPeerConnection (webrtc transport only)
-let remoteAudio = null;
+let remoteAudio = null; // hidden muted element that keeps the remote stream alive
+let rtcCtx = null; // WebAudio graph for webrtc playback (gain = ducking)
+let rtcGain = null;
+let rtcActive = false; // audio currently riding webrtc (false after fallback)
+let rtcWatchdog = null;
+let sid = null;
 let running = false;
 
 let userBubble = null; // live (partial) user bubble
@@ -129,25 +134,11 @@ async function start() {
   }
 
   if (!useRtc()) {
-    // Capture context pinned to 16 kHz (the browser resamples the mic for us).
-    inCtx = new AudioContext({ sampleRate: 16000 });
-    await inCtx.audioWorklet.addModule("/mic-worklet.js");
-    const src = inCtx.createMediaStreamSource(micStream);
-    const mic = new AudioWorkletNode(inCtx, "mic-capture");
-    src.connect(mic);
-    mic.port.onmessage = (e) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
-    };
-
-    // Playback context pinned to Fish's 24 kHz output.
-    outCtx = new AudioContext({ sampleRate: 24000 });
-    await outCtx.audioWorklet.addModule("/player-worklet.js");
-    player = new AudioWorkletNode(outCtx, "pcm-player");
-    player.connect(outCtx.destination);
-    player.port.onmessage = (e) => {
-      agentSpeaking = e.data.playing;
-      if (running) setOrb(agentSpeaking ? "speaking" : "listening");
-    };
+    await initWsAudio();
+  } else {
+    // Create the playback context inside the click gesture so iOS lets it run.
+    rtcCtx = new AudioContext();
+    rtcCtx.resume();
   }
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -171,17 +162,67 @@ async function start() {
   setStatus("connecting…");
 }
 
+// WS transport audio: mic worklet up, PCM player worklet down. Also used as
+// the fallback when the WebRTC path can't connect (firewalls, cell networks).
+async function initWsAudio() {
+  // Capture context pinned to 16 kHz (the browser resamples the mic for us).
+  inCtx = new AudioContext({ sampleRate: 16000 });
+  await inCtx.audioWorklet.addModule("/mic-worklet.js");
+  const src = inCtx.createMediaStreamSource(micStream);
+  const mic = new AudioWorkletNode(inCtx, "mic-capture");
+  src.connect(mic);
+  mic.port.onmessage = (e) => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
+  };
+
+  // Playback context pinned to Fish's 24 kHz output.
+  outCtx = new AudioContext({ sampleRate: 24000 });
+  await outCtx.audioWorklet.addModule("/player-worklet.js");
+  player = new AudioWorkletNode(outCtx, "pcm-player");
+  player.connect(outCtx.destination);
+  player.port.onmessage = (e) => {
+    agentSpeaking = e.data.playing;
+    if (running) setOrb(agentSpeaking ? "speaking" : "listening");
+  };
+}
+
 // WebRTC transport: mic and speaker ride a PeerConnection; the Go gateway
 // terminates it and bridges PCM to the engine. No STUN needed — the gateway
 // answers with host candidates (ICE-Lite).
-async function setupRtc(sid) {
+async function setupRtc(id) {
+  rtcActive = true;
   pc = new RTCPeerConnection();
   for (const track of micStream.getAudioTracks()) pc.addTrack(track, micStream);
   pc.ontrack = (e) => {
+    // Muted element keeps the remote stream flowing; audible playback goes
+    // through a WebAudio gain node so the server can duck it (barge-in hold).
     remoteAudio = new Audio();
     remoteAudio.srcObject = e.streams[0];
-    remoteAudio.play();
+    remoteAudio.muted = true;
+    remoteAudio.play().catch(() => {});
+    const src = rtcCtx.createMediaStreamSource(e.streams[0]);
+    rtcGain = rtcCtx.createGain();
+    src.connect(rtcGain);
+    rtcGain.connect(rtcCtx.destination);
   };
+  pc.onconnectionstatechange = () => {
+    const st = pc?.connectionState;
+    if (!st) return;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "rtc_state", state: st }));
+    if (rtcActive && st !== "connected") setStatus(`webrtc: ${st}`);
+    if (st === "connected") {
+      clearTimeout(rtcWatchdog);
+      setStatus("listening — say something");
+    } else if (st === "failed") {
+      fallbackToWs("webrtc failed");
+    }
+  };
+  // If ICE can't get through (firewall, AP isolation, cellular), don't strand
+  // the user — drop to websocket audio on the connection we already have.
+  rtcWatchdog = setTimeout(() => {
+    if (pc && pc.connectionState !== "connected") fallbackToWs("webrtc timeout");
+  }, 7000);
+
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await new Promise((resolve) => {
@@ -194,21 +235,42 @@ async function setupRtc(sid) {
   const res = await fetch("/rtc/offer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sid, sdp: pc.localDescription.sdp }),
+    body: JSON.stringify({ sid: id, sdp: pc.localDescription.sdp }),
   });
   if (!res.ok) {
-    setStatus("webrtc gateway unavailable");
+    fallbackToWs("webrtc gateway unavailable");
     return;
   }
   const { sdp } = await res.json();
   await pc.setRemoteDescription({ type: "answer", sdp });
 }
 
+async function fallbackToWs(why) {
+  if (!running || !rtcActive) return;
+  rtcActive = false;
+  clearTimeout(rtcWatchdog);
+  console.warn(`${why} — falling back to websocket audio`);
+  setStatus(`${why} — using websocket audio`);
+  ws?.send(JSON.stringify({ type: "use_ws_audio" }));
+  pc?.close();
+  pc = null;
+  rtcCtx?.close();
+  rtcCtx = rtcGain = remoteAudio = null;
+  await initWsAudio();
+}
+
+function setDuck(on) {
+  const v = on ? 0.15 : 1;
+  player?.port.postMessage({ cmd: "gain", value: v });
+  if (rtcGain) rtcGain.gain.value = v;
+}
+
 function handleEvent(msg) {
   switch (msg.type) {
     case "session":
+      sid = msg.sid;
       sendConfig();
-      if (useRtc()) setupRtc(msg.sid).catch(() => setStatus("webrtc setup failed"));
+      if (useRtc()) setupRtc(sid).catch(() => fallbackToWs("webrtc setup failed"));
       break;
     case "ready":
       setStatus("listening — say something");
@@ -236,7 +298,13 @@ function handleEvent(msg) {
       log.scrollTop = log.scrollHeight;
       setStatus("speaking");
       // No player worklet on the webrtc path — approximate the orb from events.
-      if (useRtc()) setOrb("speaking");
+      if (rtcActive) setOrb("speaking");
+      break;
+    case "duck": // barge-in being evaluated — soften playback instantly
+      setDuck(true);
+      break;
+    case "unduck": // false alarm (our own echo) — swell back
+      setDuck(false);
       break;
     case "clear": // barge-in: stop playback immediately
       // Only mark the reply interrupted if it was actually cut off — "clear"
@@ -244,14 +312,15 @@ function handleEvent(msg) {
       // webrtc path the gateway drops its paced queue; nothing to do here.
       if (agentBubble || agentSpeaking) lastAgentBubble?.classList.add("interrupted");
       player?.port.postMessage({ cmd: "clear" });
+      setDuck(false);
       agentBubble = null;
       setStatus("listening");
-      if (useRtc()) setOrb("listening");
+      if (rtcActive) setOrb("listening");
       break;
     case "agent_done":
       agentBubble = null;
       setStatus("listening");
-      if (useRtc()) setOrb("listening");
+      if (rtcActive) setOrb("listening");
       break;
     case "echo_suppressed":
       // The engine decided this "user turn" was the agent's own voice.
@@ -278,14 +347,17 @@ function handleEvent(msg) {
 function stop(reason) {
   if (!running) return;
   running = false;
+  clearTimeout(rtcWatchdog);
+  rtcActive = false;
   ws?.close();
   pc?.close();
   remoteAudio?.pause();
   micStream?.getTracks().forEach((t) => t.stop());
   inCtx?.close();
   outCtx?.close();
+  rtcCtx?.close();
   ws = null;
-  pc = remoteAudio = null;
+  pc = remoteAudio = rtcCtx = rtcGain = sid = null;
   inCtx = outCtx = player = micStream = null;
   // Fresh slate: empty the transcript and reset the latency chips.
   log.innerHTML = HINT_HTML;

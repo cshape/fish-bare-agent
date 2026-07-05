@@ -6,10 +6,16 @@ class PcmPlayer extends AudioWorkletProcessor {
     this.queue = []; // Float32Array chunks
     this.offset = 0; // read position within queue[0]
     this.playing = false;
+    this.gain = 1; // ducked during held barge-in evaluation
     this.port.onmessage = (e) => {
       if (e.data.cmd === "clear") {
         this.queue = [];
         this.offset = 0;
+        this.gain = 1;
+        return;
+      }
+      if (e.data.cmd === "gain") {
+        this.gain = e.data.value;
         return;
       }
       const pcm = e.data; // Int16Array
@@ -25,7 +31,7 @@ class PcmPlayer extends AudioWorkletProcessor {
     while (i < out.length && this.queue.length) {
       const head = this.queue[0];
       const n = Math.min(out.length - i, head.length - this.offset);
-      out.set(head.subarray(this.offset, this.offset + n), i);
+      for (let k = 0; k < n; k++) out[i + k] = head[this.offset + k] * this.gain;
       i += n;
       this.offset += n;
       if (this.offset === head.length) {

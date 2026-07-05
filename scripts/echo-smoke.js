@@ -35,6 +35,8 @@ const enqueue = (pcm) => {
 let agentText = "";
 let echoInjected = false;
 let echoSuppressed = false;
+let ducked = false;
+let unducked = false;
 let clears = 0;
 let finals = [];
 let done = false;
@@ -70,6 +72,9 @@ ws.on("message", (data, isBinary) => {
     case "agent_text":
       agentText += msg.text;
       break;
+    case "user_partial":
+      if (echoInjected) console.log(`[echo-smoke] partial: "${msg.text}"`);
+      break;
     case "user_final":
       finals.push(msg.text);
       console.log(`[echo-smoke] user_final: "${msg.text}"`);
@@ -77,24 +82,44 @@ ws.on("message", (data, isBinary) => {
     case "clear":
       if (echoInjected) clears++;
       break;
+    case "duck":
+      if (echoInjected) ducked = true;
+      break;
+    case "unduck":
+      if (echoInjected) unducked = true;
+      break;
     case "echo_suppressed":
       echoSuppressed = true;
       console.log(`[echo-smoke] echo suppressed: "${msg.text}"`);
       break;
-    case "agent_done": {
-      if (!echoInjected) break; // story ended before we injected — inconclusive
-      done = true;
-      clearTimeout(timeout);
-      const answeredEcho = finals.length > 1;
-      console.log(
-        `[echo-smoke] suppressed=${echoSuppressed} clears-after-echo=${clears} extra-turns=${finals.length - 1}`,
-      );
-      const ok = echoSuppressed && clears === 0 && !answeredEcho;
-      console.log(ok ? "[echo-smoke] PASS" : "[echo-smoke] FAIL");
-      process.exit(ok ? 0 : 1);
-    }
+    case "agent_done":
+      // Synthesis finishing != echo resolved — Flux may still be waiting out
+      // the echo turn's silence. Give it a grace window, or finish early
+      // once the echo verdict lands (see below).
+      if (echoInjected && !done) scheduleFinish(15000);
+      break;
   }
+  if (echoInjected && (echoSuppressed || finals.length > 1)) scheduleFinish(1500);
 });
+
+function scheduleFinish(delayMs) {
+  if (scheduleFinish.timer && delayMs > 1500) return; // keep the earlier finish
+  clearTimeout(scheduleFinish.timer);
+  scheduleFinish.timer = setTimeout(finish, delayMs);
+}
+
+function finish() {
+  if (done) return;
+  done = true;
+  clearTimeout(timeout);
+  const answeredEcho = finals.length > 1;
+  console.log(
+    `[echo-smoke] suppressed=${echoSuppressed} clears-after-echo=${clears} extra-turns=${finals.length - 1} duck=${ducked} unduck=${unducked}`,
+  );
+  const ok = echoSuppressed && clears === 0 && !answeredEcho && ducked && unducked;
+  console.log(ok ? "[echo-smoke] PASS" : "[echo-smoke] FAIL");
+  process.exit(ok ? 0 : 1);
+}
 
 ws.on("error", (e) => {
   console.error(`[echo-smoke] ws error: ${e.message}`);

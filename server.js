@@ -138,16 +138,28 @@ function normalizeText(s) {
     .trim();
 }
 
-function isEchoOf(transcript, agentText) {
+// Echo preserves word ORDER, so fuzzy matching compares consecutive-word
+// pairs (bigrams), not word bags — "what is two plus two" reuses common
+// words from a story but shares none of its bigrams, while STT-mangled echo
+// keeps long runs intact. threshold = minimum bigram coverage; callers pick
+// per stakes: suppressing a finished turn wants high confidence (0.6),
+// merely *continuing to hold* a barge-in wants low (0.35), because cutting
+// the agent's audio is the irreversible action.
+function isEchoOf(transcript, agentText, threshold = 0.6) {
   const t = normalizeText(transcript);
   const a = normalizeText(agentText);
   if (!t || !a) return false;
   if (a.includes(t)) return true;
-  // Fuzzy: STT mangles echo, so accept high word overlap too.
-  const words = t.split(" ");
-  const agentWords = new Set(a.split(" "));
-  const hits = words.filter((w) => agentWords.has(w)).length;
-  return words.length >= 2 && hits / words.length >= 0.8;
+  const tw = t.split(" ");
+  if (tw.length < 2) return false;
+  const aw = a.split(" ");
+  const agentBigrams = new Set();
+  for (let i = 0; i < aw.length - 1; i++) agentBigrams.add(aw[i] + " " + aw[i + 1]);
+  let hits = 0;
+  for (let i = 0; i < tw.length - 1; i++) {
+    if (agentBigrams.has(tw[i] + " " + tw[i + 1])) hits++;
+  }
+  return hits / (tw.length - 1) >= threshold;
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +466,12 @@ class Session {
   #maybeConfirmBarge(transcript, final = false) {
     if (!this.bargeHeld) return;
     const words = transcript.split(/\s+/).filter(Boolean).length;
-    const echo = this.cfg.echoFilter && isEchoOf(transcript, this.#recentAgentText());
+    // Low threshold on purpose: anything even half-resembling the agent's
+    // own phrasing keeps the hold. Real interruptions share ~no bigrams with
+    // the agent's speech, so they still confirm instantly.
+    const echo = this.cfg.echoFilter && isEchoOf(transcript, this.#recentAgentText(), 0.35);
     if (!echo && (final || words >= this.cfg.minWords)) {
+      console.log(`[session] ${this.sid} barge confirmed by: "${transcript}"`);
       this.bargeHeld = false;
       if (this.turn) this.#cancelTurn();
       this.sendClear();
@@ -470,7 +486,12 @@ class Session {
         // speaking — that's the echo-suspicion window for this whole turn.
         this.userTurnAudible = this.agentAudible();
         this.bargeHeld = this.userTurnAudible && this.cfg.bargeMode === "smart";
-        if (!this.bargeHeld) {
+        if (this.bargeHeld) {
+          // Duck playback immediately (feels responsive; also physically
+          // shrinks the echo), cut fully once the transcript proves real
+          // speech, swell back if it turns out to be our own echo.
+          this.sendJson({ type: "duck" });
+        } else {
           // Instant cut. Clear even with no turn in flight — the client-side
           // playback queue can outlive the server-side turn.
           if (this.turn) this.#cancelTurn();
@@ -506,13 +527,15 @@ class Session {
       case "EndOfTurn": {
         if (!transcript) {
           if (this.turn && !this.turn.committed) this.#cancelTurn();
+          if (this.bargeHeld) this.sendJson({ type: "unduck" });
           this.bargeHeld = false;
           break;
         }
         if (this.#isSuppressedEcho(transcript)) {
           // The "user" was the agent's own voice. Never answer it. In smart
-          // mode nothing was cut, so the agent talks straight through.
+          // mode nothing was cut — swell the volume back and talk on.
           console.log(`[session] ${this.sid} echo suppressed: "${transcript}"`);
+          if (this.bargeHeld) this.sendJson({ type: "unduck" });
           this.bargeHeld = false;
           this.sendJson({ type: "echo_suppressed", text: transcript });
           break;
@@ -790,7 +813,20 @@ server.on("upgrade", (req, socket, head) => {
         }
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.type === "config") session.applyConfig(msg);
+          if (msg.type === "config") {
+            session.applyConfig(msg);
+          } else if (msg.type === "use_ws_audio") {
+            // Client gave up on the WebRTC path (ICE failed) — detach the
+            // gateway so audio flows over this websocket again.
+            console.log(`[session] ${session.sid} falling back to ws audio`);
+            try {
+              session.gatewayWs?.close();
+            } catch {}
+            session.gatewayWs = null;
+          } else if (msg.type === "rtc_state") {
+            // Device-test breadcrumb: how far did the phone's ICE get?
+            console.log(`[session] ${session.sid} rtc: ${msg.state}`);
+          }
         } catch {}
       });
       client.on("close", () => {
