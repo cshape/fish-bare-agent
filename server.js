@@ -21,6 +21,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { encode as mpEncode, decode as mpDecode } from "@msgpack/msgpack";
@@ -45,6 +46,11 @@ const DEEPGRAM_EAGER_EOT_THRESHOLD = process.env.DEEPGRAM_EAGER_EOT_THRESHOLD ||
 const LLM_BASE_URL = required("LLM_BASE_URL");
 const LLM_API_KEY = required("LLM_API_KEY");
 const LLM_MODEL = process.env.LLM_MODEL || "google/gemma-4-26B-A4B-it";
+
+// Optional WebRTC media gateway (gateway/, Go + Pion). When a client asks for
+// transport=webrtc, audio flows browser <-> gateway <-> engine; this engine
+// proxies the SDP offer so the browser only ever talks to one origin.
+const GATEWAY_URL = process.env.GATEWAY_URL || "http://127.0.0.1:8788";
 
 const FISH_API_KEY = required("FISH_API_KEY");
 const FISH_MODEL = process.env.FISH_MODEL || "s2.1-pro";
@@ -268,7 +274,11 @@ function openFishTurn({ onAudio, onFinish, onError }) {
 
 class Session {
   constructor(client) {
+    this.sid = randomUUID();
     this.client = client;
+    // Audio transport: browser WS by default; a WebRTC gateway socket takes
+    // over both directions when one attaches (JSON events stay on `client`).
+    this.gatewayWs = null;
     this.history = [];
     this.turn = null;
     this.turnCounter = 0;
@@ -287,9 +297,32 @@ class Session {
   }
 
   sendAudio(buf) {
-    if (this.client.readyState === WebSocket.OPEN) {
-      this.client.send(buf, { binary: true });
+    const sink = this.gatewayWs ?? this.client;
+    if (sink.readyState === WebSocket.OPEN) {
+      sink.send(buf, { binary: true });
     }
+  }
+
+  // Barge-in flush must reach both the UI (transcript state) and whichever
+  // transport is pacing audio (the gateway keeps its own outbound queue).
+  sendClear() {
+    this.sendJson({ type: "clear" });
+    if (this.gatewayWs?.readyState === WebSocket.OPEN) {
+      this.gatewayWs.send(JSON.stringify({ type: "clear" }));
+    }
+  }
+
+  attachGateway(ws) {
+    this.gatewayWs = ws;
+    ws.on("message", (data, isBinary) => {
+      if (isBinary) this.onMicAudio(data);
+    });
+    ws.on("close", () => {
+      if (this.gatewayWs === ws) this.gatewayWs = null;
+    });
+    ws.on("error", () => {
+      if (this.gatewayWs === ws) this.gatewayWs = null;
+    });
   }
 
   onMicAudio(buf) {
@@ -352,7 +385,7 @@ class Session {
         // synthesizes faster than realtime, so the browser's audio queue can
         // outlive the server-side turn by several seconds.
         if (this.turn) this.#cancelTurn();
-        this.sendJson({ type: "clear" });
+        this.sendClear();
         this.sendJson({ type: "user_start" });
         break;
 
@@ -459,7 +492,7 @@ class Session {
           { role: "assistant", content: t.spoken + "…" },
         );
       }
-      this.sendJson({ type: "clear" }); // browser drops its playback buffer
+      this.sendClear(); // flush queued playback everywhere
     }
     // Speculative turns roll back silently: no client messages, no history.
   }
@@ -564,6 +597,9 @@ class Session {
     this.turn?.fish?.close();
     this.turn = null;
     try {
+      this.gatewayWs?.close();
+    } catch {}
+    try {
       this.dg.close();
     } catch {}
   }
@@ -579,8 +615,40 @@ const MIME = {
   ".css": "text/css; charset=utf-8",
 };
 
+const sessions = new Map(); // sid -> Session
+
+// Browser -> engine -> gateway SDP relay, so the page only talks to one origin.
+async function handleRtcOffer(req, res) {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", async () => {
+    try {
+      const { sid, sdp } = JSON.parse(body);
+      if (!sessions.has(sid)) {
+        res.writeHead(404).end(JSON.stringify({ error: "unknown session" }));
+        return;
+      }
+      const upstream = await fetch(`${GATEWAY_URL}/offer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sid, sdp }),
+      });
+      const answer = await upstream.text();
+      res.writeHead(upstream.status, { "Content-Type": "application/json" });
+      res.end(answer);
+    } catch (err) {
+      console.error("[rtc] offer relay failed:", err.message);
+      res.writeHead(502).end(JSON.stringify({ error: "gateway unreachable" }));
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
+  if (req.method === "POST" && url.pathname === "/rtc/offer") {
+    handleRtcOffer(req, res);
+    return;
+  }
   let file = url.pathname === "/" ? "/index.html" : url.pathname;
   file = path.normalize(file).replace(/^(\.\.[/\\])+/, "");
   const full = path.join(__dirname, "public", file);
@@ -598,19 +666,49 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (client) => {
-  console.log("[session] connected");
-  const session = new Session(client);
-  client.on("message", (data, isBinary) => {
-    if (isBinary) session.onMicAudio(data);
-  });
-  client.on("close", () => {
-    console.log("[session] closed");
-    session.destroy();
-  });
-  client.on("error", () => session.destroy());
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url, "http://x");
+
+  if (url.pathname === "/ws") {
+    // Browser (or smoke client): owns the session and all JSON events.
+    wss.handleUpgrade(req, socket, head, (client) => {
+      const session = new Session(client);
+      sessions.set(session.sid, session);
+      console.log(`[session] ${session.sid} connected`);
+      session.sendJson({ type: "session", sid: session.sid });
+      client.on("message", (data, isBinary) => {
+        if (isBinary) session.onMicAudio(data);
+      });
+      client.on("close", () => {
+        console.log(`[session] ${session.sid} closed`);
+        sessions.delete(session.sid);
+        session.destroy();
+      });
+      client.on("error", () => {
+        sessions.delete(session.sid);
+        session.destroy();
+      });
+    });
+    return;
+  }
+
+  if (url.pathname === "/gateway") {
+    // WebRTC gateway attaching as the audio transport for an existing session.
+    const session = sessions.get(url.searchParams.get("sid"));
+    if (!session) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (gw) => {
+      console.log(`[session] ${session.sid} gateway attached`);
+      session.attachGateway(gw);
+    });
+    return;
+  }
+
+  socket.destroy();
 });
 
 server.listen(PORT, () => {

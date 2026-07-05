@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env server.js",
-    "smoke": "node --env-file=.env scripts/smoke.js"
+    "smoke": "node --env-file=.env scripts/smoke.js",
+    "smoke:rtc": "scripts/rtc-smoke.sh"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",

@@ -1,5 +1,11 @@
-// Browser side: mic -> WS (PCM16 @ 16 kHz), WS -> speaker (PCM16 @ 24 kHz),
-// plus a running transcript from the server's JSON events.
+// Browser side. Two transports:
+//   default        mic -> WS (PCM16 @ 16 kHz), WS -> speaker (PCM16 @ 24 kHz)
+//   ?transport=webrtc   audio rides a PeerConnection through the Go/Pion
+//                       gateway (Opus @ 48 kHz); the WS carries JSON only.
+// JSON events (transcripts, metrics, clear) arrive on the WS either way.
+
+const USE_RTC = new URLSearchParams(location.search).get("transport") === "webrtc";
+if (USE_RTC) document.querySelector(".sub").textContent += " · webrtc";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log");
@@ -12,6 +18,8 @@ let inCtx = null;
 let outCtx = null;
 let player = null;
 let micStream = null;
+let pc = null; // RTCPeerConnection (webrtc transport only)
+let remoteAudio = null;
 let running = false;
 
 let userBubble = null; // live (partial) user bubble
@@ -67,34 +75,35 @@ async function start() {
     return;
   }
 
-  // Capture context pinned to 16 kHz (the browser resamples the mic for us).
-  inCtx = new AudioContext({ sampleRate: 16000 });
-  await inCtx.audioWorklet.addModule("/mic-worklet.js");
-  const src = inCtx.createMediaStreamSource(micStream);
-  const mic = new AudioWorkletNode(inCtx, "mic-capture");
-  src.connect(mic);
+  if (!USE_RTC) {
+    // Capture context pinned to 16 kHz (the browser resamples the mic for us).
+    inCtx = new AudioContext({ sampleRate: 16000 });
+    await inCtx.audioWorklet.addModule("/mic-worklet.js");
+    const src = inCtx.createMediaStreamSource(micStream);
+    const mic = new AudioWorkletNode(inCtx, "mic-capture");
+    src.connect(mic);
+    mic.port.onmessage = (e) => {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
+    };
 
-  // Playback context pinned to Fish's 24 kHz output.
-  outCtx = new AudioContext({ sampleRate: 24000 });
-  await outCtx.audioWorklet.addModule("/player-worklet.js");
-  player = new AudioWorkletNode(outCtx, "pcm-player");
-  player.connect(outCtx.destination);
-  player.port.onmessage = (e) => {
-    agentSpeaking = e.data.playing;
-    if (running) setOrb(agentSpeaking ? "speaking" : "listening");
-  };
+    // Playback context pinned to Fish's 24 kHz output.
+    outCtx = new AudioContext({ sampleRate: 24000 });
+    await outCtx.audioWorklet.addModule("/player-worklet.js");
+    player = new AudioWorkletNode(outCtx, "pcm-player");
+    player.connect(outCtx.destination);
+    player.port.onmessage = (e) => {
+      agentSpeaking = e.data.playing;
+      if (running) setOrb(agentSpeaking ? "speaking" : "listening");
+    };
+  }
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
 
-  mic.port.onmessage = (e) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(e.data.buffer);
-  };
-
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) {
-      player.port.postMessage(new Int16Array(e.data));
+      player?.port.postMessage(new Int16Array(e.data));
       return;
     }
     handleEvent(JSON.parse(e.data));
@@ -109,8 +118,44 @@ async function start() {
   setStatus("connecting…");
 }
 
+// WebRTC transport: mic and speaker ride a PeerConnection; the Go gateway
+// terminates it and bridges PCM to the engine. No STUN needed — the gateway
+// answers with host candidates (ICE-Lite).
+async function setupRtc(sid) {
+  pc = new RTCPeerConnection();
+  for (const track of micStream.getAudioTracks()) pc.addTrack(track, micStream);
+  pc.ontrack = (e) => {
+    remoteAudio = new Audio();
+    remoteAudio.srcObject = e.streams[0];
+    remoteAudio.play();
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise((resolve) => {
+    // Non-trickle: wait for gathering so the offer carries all candidates.
+    if (pc.iceGatheringState === "complete") return resolve();
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === "complete") resolve();
+    };
+  });
+  const res = await fetch("/rtc/offer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sid, sdp: pc.localDescription.sdp }),
+  });
+  if (!res.ok) {
+    setStatus("webrtc gateway unavailable");
+    return;
+  }
+  const { sdp } = await res.json();
+  await pc.setRemoteDescription({ type: "answer", sdp });
+}
+
 function handleEvent(msg) {
   switch (msg.type) {
+    case "session":
+      if (USE_RTC) setupRtc(msg.sid).catch(() => setStatus("webrtc setup failed"));
+      break;
     case "ready":
       setStatus("listening — say something");
       setOrb("listening");
@@ -136,18 +181,23 @@ function handleEvent(msg) {
       agentBubble.textContent += msg.text;
       log.scrollTop = log.scrollHeight;
       setStatus("speaking");
+      // No player worklet on the webrtc path — approximate the orb from events.
+      if (USE_RTC) setOrb("speaking");
       break;
     case "clear": // barge-in: stop playback immediately
       // Only mark the reply interrupted if it was actually cut off — "clear"
-      // also arrives on every normal turn start as a safety flush.
+      // also arrives on every normal turn start as a safety flush. On the
+      // webrtc path the gateway drops its paced queue; nothing to do here.
       if (agentBubble || agentSpeaking) lastAgentBubble?.classList.add("interrupted");
       player?.port.postMessage({ cmd: "clear" });
       agentBubble = null;
       setStatus("listening");
+      if (USE_RTC) setOrb("listening");
       break;
     case "agent_done":
       agentBubble = null;
       setStatus("listening");
+      if (USE_RTC) setOrb("listening");
       break;
     case "metrics":
       showMetrics(msg);
@@ -165,10 +215,13 @@ function stop(reason) {
   if (!running) return;
   running = false;
   ws?.close();
+  pc?.close();
+  remoteAudio?.pause();
   micStream?.getTracks().forEach((t) => t.stop());
   inCtx?.close();
   outCtx?.close();
   ws = null;
+  pc = remoteAudio = null;
   inCtx = outCtx = player = micStream = null;
   // Fresh slate: empty the transcript and reset the latency chips.
   log.innerHTML = HINT_HTML;

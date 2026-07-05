@@ -37,6 +37,29 @@ Sanity-check the whole pipeline without a mic (macOS only, uses `say`):
 npm run smoke
 ```
 
+## WebRTC transport (optional)
+
+By default audio rides the websocket as raw PCM — great locally, fragile on
+bad networks. The `gateway/` directory is a Go/Pion media gateway that
+terminates WebRTC (Opus, jitter buffering, loss concealment) and bridges PCM
+to the engine. The engine relays SDP via `POST /rtc/offer`, so the page only
+talks to one origin; all calls share a single UDP port (ICE-Lite + UDP mux).
+
+```sh
+cd gateway && go run -tags nolibopusfile .   # needs Go >= 1.22 + libopus
+# then open http://localhost:8787/?transport=webrtc
+```
+
+Headless end-to-end test of the WebRTC path (Pion client stands in for the
+browser):
+
+```sh
+npm run smoke:rtc
+```
+
+`docker compose up --build` runs both services (see compose.yaml for the
+macOS UDP caveat; on Linux set `GATEWAY_PUBLIC_IP`).
+
 ## How it works
 
 - **Turn-taking** is Deepgram Flux's native `StartOfTurn` / `EndOfTurn` — no
@@ -63,10 +86,13 @@ speculative start, more wasted tokens), `FISH_LATENCY_MODE`
 ## Layout
 
 ```
-server.js                 everything server-side (~600 lines)
+server.js                 everything server-side (~700 lines)
 public/index.html         UI
-public/app.js             mic/playback wiring + transcript
-public/mic-worklet.js     16 kHz PCM16 capture
-public/player-worklet.js  24 kHz streaming PCM player
-scripts/smoke.js          headless end-to-end test
+public/app.js             mic/playback wiring + transcript (WS or WebRTC)
+public/mic-worklet.js     16 kHz PCM16 capture (WS transport)
+public/player-worklet.js  24 kHz streaming PCM player (WS transport)
+scripts/smoke.js          headless end-to-end test (WS transport)
+gateway/                  Go/Pion WebRTC media gateway
+gateway/internal/dsp/     FIR resamplers (48k->16k, 24k->48k)
+gateway/cmd/smoke/        headless end-to-end test (WebRTC transport)
 ```
