@@ -78,6 +78,7 @@ let rtcGain = null;
 let rtcActive = false; // audio currently riding webrtc (false after fallback)
 let rtcWatchdog = null;
 let sid = null;
+let iceServers = null; // from the session message (STUN + optional TURN)
 let running = false;
 
 let userBubble = null; // live (partial) user bubble
@@ -191,9 +192,11 @@ async function initWsAudio() {
 // answers with host candidates (ICE-Lite).
 async function setupRtc(id) {
   rtcActive = true;
-  // STUN lets an off-LAN phone (e.g. cellular) and the gateway hole-punch
-  // toward each other; on localhost/LAN it's just ignored.
-  pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  // ICE servers come from the engine: STUN for hole punching, plus TURN when
+  // configured — required for cellular/CGNAT, where direct paths don't exist.
+  pc = new RTCPeerConnection({
+    iceServers: iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
+  });
   for (const track of micStream.getAudioTracks()) pc.addTrack(track, micStream);
   pc.ontrack = (e) => {
     // Muted element keeps the remote stream flowing; audible playback goes
@@ -228,10 +231,18 @@ async function setupRtc(id) {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await new Promise((resolve) => {
-    // Non-trickle: wait for gathering so the offer carries all candidates.
-    if (pc.iceGatheringState === "complete") return resolve();
+    // Non-trickle: wait for gathering so the offer carries all candidates —
+    // but cap the wait so a dead STUN/TURN server can't stall setup.
+    const cap = setTimeout(resolve, 3000);
+    if (pc.iceGatheringState === "complete") {
+      clearTimeout(cap);
+      return resolve();
+    }
     pc.onicegatheringstatechange = () => {
-      if (pc.iceGatheringState === "complete") resolve();
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(cap);
+        resolve();
+      }
     };
   });
   const res = await fetch("/rtc/offer", {
@@ -271,6 +282,7 @@ function handleEvent(msg) {
   switch (msg.type) {
     case "session":
       sid = msg.sid;
+      if (msg.iceServers) iceServers = msg.iceServers;
       sendConfig();
       if (useRtc()) setupRtc(sid).catch(() => fallbackToWs("webrtc setup failed"));
       break;

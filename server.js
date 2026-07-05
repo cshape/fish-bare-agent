@@ -52,6 +52,24 @@ const LLM_MODEL = process.env.LLM_MODEL || "google/gemma-4-26B-A4B-it";
 // proxies the SDP offer so the browser only ever talks to one origin.
 const GATEWAY_URL = process.env.GATEWAY_URL || "http://127.0.0.1:8788";
 
+// ICE servers handed to the browser (in the "session" message). TURN is what
+// makes cellular/CGNAT clients reachable: the phone relays through TURN and
+// the full-ICE gateway dials the relay outbound — no inbound path needed.
+const STUN_URL = process.env.STUN_URL || "stun:stun.l.google.com:19302";
+const TURN_URLS = (process.env.TURN_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+function clientIceServers() {
+  const servers = [{ urls: [STUN_URL] }];
+  if (TURN_URLS.length) {
+    servers.push({
+      urls: TURN_URLS,
+      username: process.env.TURN_USERNAME || "",
+      credential: process.env.TURN_PASSWORD || "",
+    });
+  }
+  return servers;
+}
+
 const FISH_API_KEY = required("FISH_API_KEY");
 const FISH_MODEL = process.env.FISH_MODEL || "s2.1-pro";
 const FISH_VOICE = process.env.FISH_VOICE || "";
@@ -805,7 +823,7 @@ server.on("upgrade", (req, socket, head) => {
       const session = new Session(client);
       sessions.set(session.sid, session);
       console.log(`[session] ${session.sid} connected`);
-      session.sendJson({ type: "session", sid: session.sid });
+      session.sendJson({ type: "session", sid: session.sid, iceServers: clientIceServers() });
       client.on("message", (data, isBinary) => {
         if (isBinary) {
           session.onMicAudio(data);
