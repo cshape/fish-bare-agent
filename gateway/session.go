@@ -31,10 +31,12 @@ type session struct {
 	engine *websocket.Conn
 	track  *webrtc.TrackLocalStaticSample
 
-	mu       sync.Mutex // guards engine writes + outbound buffer
-	outPCM   []int16    // 48 kHz PCM awaiting encode/pacing
-	closed   bool
+	mu        sync.Mutex // guards engine writes + outbound buffer
+	outPCM    []int16    // 48 kHz PCM awaiting encode/pacing
+	closed    bool
 	closeOnce sync.Once
+	gotAudio  bool // first engine audio seen (timing log)
+	sentRTP   bool // first RTP frame sent (timing log)
 }
 
 func newSession(sid string, pc *webrtc.PeerConnection, engine *websocket.Conn, track *webrtc.TrackLocalStaticSample) *session {
@@ -113,6 +115,10 @@ func (s *session) readEngine() {
 		case websocket.BinaryMessage:
 			pcm48 := up.Process(dsp.BytesToPCM(data))
 			s.mu.Lock()
+			if !s.gotAudio {
+				s.gotAudio = true
+				log.Printf("[%s] first engine audio t=%d", s.sid, time.Now().UnixMilli())
+			}
 			s.outPCM = append(s.outPCM, pcm48...)
 			s.mu.Unlock()
 		case websocket.TextMessage:
@@ -170,5 +176,11 @@ func (s *session) pace() {
 		}); err != nil {
 			return
 		}
+		s.mu.Lock()
+		if !s.sentRTP {
+			s.sentRTP = true
+			log.Printf("[%s] first rtp out t=%d", s.sid, time.Now().UnixMilli())
+		}
+		s.mu.Unlock()
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -89,6 +90,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	connected := make(chan struct{})
+	var connectedOnce sync.Once
+	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
+		if st == webrtc.PeerConnectionStateConnected {
+			connectedOnce.Do(func() { close(connected) })
+		}
+	})
+
 	replySamples := make(chan int, 1024) // decoded sample counts per packet
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		dec, err := opus.NewDecoder(48000, 1)
@@ -135,7 +144,14 @@ func main() {
 	}); err != nil {
 		log.Fatal(err)
 	}
-	log.Print("webrtc negotiated, speaking…")
+	// Samples written before DTLS/SRTP is up are silently dropped — wait for
+	// the connection before "speaking" or the question can be lost.
+	select {
+	case <-connected:
+	case <-time.After(15 * time.Second):
+		log.Fatal("FAIL: webrtc never connected")
+	}
+	log.Print("webrtc connected, speaking…")
 
 	// --- "mic": pace the WAV as 20 ms Opus frames, then silence -------------
 	go func() {
